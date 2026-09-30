@@ -108,10 +108,10 @@ SYSTEM_PROMPT = """당신은 대한민국 국세청의 '국제거래정보통합
    - 정중하고 전문적인 공공 세무 상담원 톤앤매너를 유지하세요.
 """
 
-def generate_chat_response_stream(query: str, chat_history: list = None, max_retries: int = 5):
+def generate_chat_response_stream(query: str, chat_history: list = None, max_retries_per_model: int = 2):
     """
-    RAG 검색을 수행하고 gemini-3.8-flash 스트리밍 생성 제너레이터를 반환합니다.
-    503 과부하 에러 발생 시 자동 대기 후 재시도합니다.
+    RAG 검색을 수행하고 최적의 Gemini Flash 모델 스트리밍 생성 제너레이터를 반환합니다.
+    특정 모델에서 503(과부하/일시적 지연) 또는 429 에러 발생 시 다른 안정적인 모델로 자동 대체(Fallback)하여 답변을 생성합니다.
     """
     chunks = search_relevant_chunks(query, top_k=5)
 
@@ -135,29 +135,55 @@ def generate_chat_response_stream(query: str, chat_history: list = None, max_ret
 
     client = get_gemini_client()
 
+    # 가용 모델 후보군 (우선순위 순서대로 시도)
+    custom_model = os.getenv("GEMINI_MODEL")
+    candidate_models = ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    if custom_model:
+        if custom_model in candidate_models:
+            candidate_models.remove(custom_model)
+        candidate_models.insert(0, custom_model)
+
     def stream_generator():
-        wait_time = 3
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content_stream(
-                    model="gemini-3.8-flash",
-                    contents=user_content,
-                    config={
-                        "system_instruction": SYSTEM_PROMPT,
-                        "temperature": 0.2,
-                    }
-                )
-                for chunk in response:
-                    if chunk.text:
-                        yield chunk.text
-                return
-            except Exception as e:
-                err_msg = str(e)
-                if ("503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg) and attempt < max_retries - 1:
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 1.5, 10)
-                else:
-                    yield f"\n\n⚠️ 일시적인 서버 지연이 발생했습니다. 다시 시도해 주세요: {e}"
+        last_error = None
+        has_yielded = False
+
+        for model_name in candidate_models:
+            wait_time = 1.5
+            for attempt in range(max_retries_per_model):
+                try:
+                    response = client.models.generate_content_stream(
+                        model=model_name,
+                        contents=user_content,
+                        config={
+                            "system_instruction": SYSTEM_PROMPT,
+                            "temperature": 0.2,
+                        }
+                    )
+                    for chunk in response:
+                        if chunk.text:
+                            has_yielded = True
+                            yield chunk.text
+                    # 성공적으로 스트리밍을 마쳤으므로 종료
                     return
+                except Exception as e:
+                    last_error = e
+                    err_msg = str(e)
+                    
+                    # 이미 텍스트가 일부 출력된 상태에서 중단된 경우 중복 출력을 피하기 위해 안내 메시지 출력 후 종료
+                    if has_yielded:
+                        yield f"\n\n⚠️ 답변 스트리밍 도중 일시적인 네트워크 지연이 발생했습니다: {e}"
+                        return
+                    
+                    is_transient = any(code in err_msg for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "502"])
+                    if is_transient and attempt < max_retries_per_model - 1:
+                        time.sleep(wait_time)
+                        wait_time *= 2
+                    else:
+                        # 다음 후보 모델로 폴백
+                        break
+
+        # 모든 모델 시도 실패 시
+        yield f"\n\n⚠️ AI 서버 일시적 지연으로 인해 답변 생성이 지연되었습니다. 잠시 후 다시 시도해 주세요. (오류 내용: {last_error})"
 
     return stream_generator(), chunks
+
